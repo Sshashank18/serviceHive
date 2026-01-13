@@ -134,9 +134,7 @@ def run_chat():
         
         bot_reply = output["messages"][-1]["content"]
         print(f"[Internal Intent: {output['intent']}]")
-        print(f"Agent: {bot_reply}")
-
-        print(history)        
+        print(f"Agent: {bot_reply}")      
         
         # Hook for external function calls
         if "LEAD_COMPLETE:" in bot_reply:
