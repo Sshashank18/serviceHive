@@ -4,15 +4,16 @@ import time
 from google import genai
 from typing import Annotated, TypedDict, List, Literal
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 # --- Global Config ---
-API_KEY = "YOUR API KEY HERE" 
+API_KEY = "AIzaSyAmKMPafNilxOPyEj8EOD2neOVDb4piPqA" 
 client = genai.Client(api_key=API_KEY)
-MODEL_ID = "gemini-2.5-flash" 
+MODEL_ID = "gemini-2.0-flash" 
 
-# Local knowledge base to satisfy RAG requirements
+# Local knowledge base
 KB_CONTENT = {
     "pricing": {
         "Basic Plan": "$29/month, 10 videos/month, 720p resolution",
@@ -24,24 +25,21 @@ KB_CONTENT = {
     }
 }
 
-# Dump to file so the agent reads from a "database"
 with open("autostream_kb.json", "w") as f:
     json.dump(KB_CONTENT, f)
 
 def mock_lead_capture(name, email, platform):
-    """Simulates a backend API call for lead ingestion"""
     print(f"\n" + "!"*50)
     print(f"SUCCESS: Lead captured for {name} ({email}) on {platform}")
     print("!"*50 + "\n")
 
 class AgentState(TypedDict):
-    """LangGraph state schema"""
-    messages: List[dict]
+    # add_messages handles the conversion of dicts to Message Objects
+    messages: Annotated[List[dict], add_messages]
     intent: Literal["Greeting", "Inquiry", "High-Intent", "Unknown"]
 
 class AutoStreamAgent:
     def __init__(self):
-        # Read the local store on init
         with open("autostream_kb.json", "r") as f:
             self.kb = json.load(f)
 
@@ -51,7 +49,6 @@ class AutoStreamAgent:
         reraise=True
     )
     def _call_gemini(self, contents, system_instruction):
-        """Wrapper for API calls with backoff logic for 503/429 errors"""
         return client.models.generate_content(
             model=MODEL_ID,
             contents=contents,
@@ -59,51 +56,54 @@ class AutoStreamAgent:
         )
 
     def run_agent(self, state: AgentState):
-        """Main node logic: classifies intent and generates context-aware replies"""
         prompt = f"""
         You are an AI for AutoStream. 
-        Use the following KB for technical/pricing info: {json.dumps(self.kb)}
+        KB Info: {json.dumps(self.kb)}
 
         Workflow:
         1. Classify intent: 'Greeting', 'Inquiry', or 'High-Intent'.
         2. Use KB for 'Inquiry'.
-        3. If 'High-Intent', you must get: Name, Email, and Creator Platform.
+        3. For 'High-Intent', check the history. If Name, Email, or Platform is missing, ask for it.
         
         Mandatory Format:
         Intent: [Classification]
         Response: [Your Message]
         
-        Trigger lead capture ONLY if all 3 fields are present:
+        Only if ALL 3 (Name, Email, Platform) have been provided in the history:
         LEAD_COMPLETE: [Name], [Email], [Platform]
         """
         
-        # Map message history for the Gemini SDK
+        # 1. Properly map LangGraph Objects to Gemini Format
         history = []
         for msg in state['messages']:
-            role = "user" if msg['role'] == "user" else "model"
-            history.append({"role": role, "parts": [{"text": msg['content']}]})
+            # Handle objects (HumanMessage/AIMessage) or dicts
+            m_type = getattr(msg, 'type', None) or msg.get('role')
+            m_content = getattr(msg, 'content', None) or msg.get('content')
+            
+            # Gemini expects "user" and "model"
+            role = "user" if m_type in ["human", "user"] else "model"
+            history.append({"role": role, "parts": [{"text": m_content}]})
             
         try:
             response = self._call_gemini(history, prompt)
             raw_text = response.text
-            print(raw_text)
             
-            # Simple string parsing for intent tracking
             detected_intent = "Unknown"
             for itype in ["Greeting", "Inquiry", "High-Intent"]:
                 if f"Intent: {itype}" in raw_text:
                     detected_intent = itype
             
-            # Extract just the chat part for the user
             clean_reply = raw_text.split("Response:")[-1].strip()
+            
+            # 2. Return with "ai" role (LangGraph standard) instead of "model"
             return {
-                "messages": [{"role": "model", "content": clean_reply}], 
+                "messages": [{"role": "ai", "content": clean_reply}], 
                 "intent": detected_intent
             }
         
         except Exception as e:
             return {
-                "messages": [{"role": "model", "content": f"System error: {str(e)}"}], 
+                "messages": [{"role": "ai", "content": f"System error: {str(e)}"}], 
                 "intent": "Unknown"
             }
 
@@ -114,31 +114,24 @@ builder.add_node("agent", logic.run_agent)
 builder.add_edge(START, "agent")
 builder.add_edge("agent", END)
 
-# In-memory checkpointer for session persistence
 app = builder.compile(checkpointer=MemorySaver())
 
 def run_chat():
-    """CLI loop for testing the agent workflow"""
-    # Unique thread ID allows the agent to 'remember' across turns
-    config = {"configurable": {"thread_id": "test_session_01"}}
-    print("--- AutoStream AI Online (Resilient Mode) ---")
+    config = {"configurable": {"thread_id": "session_final_fix"}}
+    print("--- AutoStream AI Online  ---")
     
     while True:
         u_in = input("\nYou: ")
         if u_in.lower() in ['exit', 'quit']: 
             break
         
-        # Invoke graph with user input
-        state_update = {"messages": [{"role": "user", "content": u_in}]}
-        output = app.invoke(state_update, config)
+        # Use "user" role here, which LangGraph accepts
+        output = app.invoke({"messages": [{"role": "user", "content": u_in}]}, config)
         
-        bot_reply = output["messages"][-1]["content"]
+        bot_reply = output["messages"][-1].content
         print(f"[Internal Intent: {output['intent']}]")
         print(f"Agent: {bot_reply}")
 
-        print(history)        
-        
-        # Hook for external function calls
         if "LEAD_COMPLETE:" in bot_reply:
             parts = bot_reply.split("LEAD_COMPLETE:")[1].strip().split(",")
             if len(parts) >= 3:
