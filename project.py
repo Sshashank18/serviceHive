@@ -130,8 +130,9 @@ def run_chat():
         
         bot_reply = output["messages"][-1].content
         print(f"[Internal Intent: {output['intent']}]")
-        print(f"Agent: {bot_reply}")
-
+        print(f"Agent: {bot_reply}")      
+        
+        # Hook for external function calls
         if "LEAD_COMPLETE:" in bot_reply:
             parts = bot_reply.split("LEAD_COMPLETE:")[1].strip().split(",")
             if len(parts) >= 3:
